@@ -77,6 +77,13 @@ class PlaybackEngine private constructor(private val context: Context) {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var mediaSession: MediaSession? = null
 
+    // Transient song: when switching playlists while playing, the current song
+    // is prepended at index 0 of `songs` as a non-persistent, faded, non-interactive
+    // row that keeps playing until it finishes or the user moves off it.
+    private var hasTransientSong: Boolean = false
+    private var transientArtworkFile: java.io.File? = null
+    private val songIndexOffset: Int get() = if (hasTransientSong) 1 else 0
+
     var stringFin: String = "End of playlist"
     var stringVide: String = "Playlist is currently empty"
 
@@ -265,6 +272,18 @@ class PlaybackEngine private constructor(private val context: Context) {
     private fun skipToNext() {
         if (!playListExists || endOfPlaylist) return
 
+        if (hasTransientSong && currentSongIndex == 0) {
+            cleanFade()
+            val wasPlaying = isPlaying
+            val mode = stopAndGo
+            if (wasPlaying && (mode == MODE_CROSSFADE || mode == MODE_SHUFFLE)) {
+                crossfadeFromTransient()
+            } else {
+                leaveTransientAndStart(wasPlaying = wasPlaying)
+            }
+            return
+        }
+
         cleanFade()
         val mode = stopAndGo
         val wasPlaying = isPlaying
@@ -326,6 +345,11 @@ class PlaybackEngine private constructor(private val context: Context) {
 
         cleanFade()
 
+        if (hasTransientSong && currentSongIndex == 0) {
+            leaveTransientAndStart(wasPlaying = isPlaying)
+            return
+        }
+
         if (endOfPlaylist) {
             val lastIndex = songs.size - 1
             if (lastIndex >= 0) jump(to = lastIndex, forcePlay = false)
@@ -354,11 +378,44 @@ class PlaybackEngine private constructor(private val context: Context) {
 
     fun jump(to: Int, forcePlay: Boolean) {
         if (to >= songs.size) return
+        if (hasTransientSong && to == 0) return // transient is non-interactive
 
         cleanFade()
 
         val mode = stopAndGo
         val wasPlaying = isPlaying
+
+        if (hasTransientSong) {
+            // Drop the transient and jump within the new playlist.
+            val realIndex = (to - 1).coerceAtLeast(0)
+            clearTransientSong()
+            endOfPlaylist = false
+            if (songs.isEmpty()) {
+                playListExists = false
+                isPlaying = false
+                onStateChanged?.invoke()
+                updateMediaSessionState()
+                return
+            }
+            playListExists = true
+            currentSongIndex = realIndex.coerceAtMost(songs.size - 1)
+            if (mode == MODE_SHUFFLE && songs.size > 1) {
+                shuffleArray.clear()
+                shuffleHasStartedPlayback = false
+                rebuildShuffleArray(jumpingTo = currentSongIndex)
+            }
+            loadPlayers()
+            when {
+                forcePlay -> startPlayback()
+                wasPlaying -> {
+                    isPlaying = false
+                    try { player?.pause() } catch (_: Exception) {}
+                }
+            }
+            onStateChanged?.invoke()
+            updateMediaSessionState()
+            return
+        }
 
         if (mode == MODE_SHUFFLE && songs.size > 1) {
             rebuildShuffleArray(jumpingTo = to)
@@ -413,6 +470,12 @@ class PlaybackEngine private constructor(private val context: Context) {
             return
         }
 
+        if (hasTransientSong && currentSongIndex == 0) {
+            Log.d(TAG, "handleTrackEnded: transient finished, advancing into new playlist")
+            handleTransientEnded()
+            return
+        }
+
         Log.d(TAG, "handleTrackEnded: index=$currentSongIndex, mode=$stopAndGo")
         advanceToNextSong()
 
@@ -434,6 +497,12 @@ class PlaybackEngine private constructor(private val context: Context) {
     private fun handleCrossfadeBoundary() {
         crossfadeBoundaryRunnable?.let { handler.removeCallbacks(it) }
         crossfadeBoundaryRunnable = null
+
+        if (hasTransientSong && currentSongIndex == 0) {
+            Log.d(TAG, "handleCrossfadeBoundary: crossfading from transient")
+            crossfadeFromTransient()
+            return
+        }
 
         Log.d(TAG, "handleCrossfadeBoundary: crossfading at index=$currentSongIndex")
 
@@ -886,7 +955,12 @@ class PlaybackEngine private constructor(private val context: Context) {
     }
 
     fun reloadFromPlaylistData() {
-        songs = PlaylistData.getInstance(context).getSongs()
+        val realSongs = PlaylistData.getInstance(context).getSongs()
+        songs = if (hasTransientSong && songs.isNotEmpty()) {
+            listOf(songs[0]) + realSongs
+        } else {
+            realSongs
+        }
     }
 
     // MARK: - Audio Focus
@@ -974,8 +1048,9 @@ class PlaybackEngine private constructor(private val context: Context) {
         val song = currentSong() ?: return null
 
         val artworkBitmap: android.graphics.Bitmap? = try {
-            PlaylistData.getInstance(context).artworkFile(forSongAt = currentSongIndex)
-                ?.let { android.graphics.BitmapFactory.decodeFile(it.absolutePath) }
+            val file = if (hasTransientSong && currentSongIndex == 0) transientArtworkFile
+                       else PlaylistData.getInstance(context).artworkFile(forSongAt = currentSongIndex)
+            file?.let { android.graphics.BitmapFactory.decodeFile(it.absolutePath) }
         } catch (_: Exception) { null }
 
         val contentIntent = android.app.PendingIntent.getActivity(
@@ -1106,7 +1181,8 @@ class PlaybackEngine private constructor(private val context: Context) {
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, (song.duration * 1000).toLong())
 
             // Load artwork bitmap from playlist folder, if any
-            val artworkFile = PlaylistData.getInstance(context).artworkFile(forSongAt = currentSongIndex)
+            val artworkFile = if (hasTransientSong && currentSongIndex == 0) transientArtworkFile
+                              else PlaylistData.getInstance(context).artworkFile(forSongAt = currentSongIndex)
             if (artworkFile != null) {
                 try {
                     val bitmap = android.graphics.BitmapFactory.decodeFile(artworkFile.absolutePath)
@@ -1129,10 +1205,17 @@ class PlaybackEngine private constructor(private val context: Context) {
     // MARK: - Playlist Editing
 
     fun deleteSong(at: Int) {
+        if (hasTransientSong && at == 0) return // transient cannot be deleted
+
         val wasPlaying = isPlaying
         val playlistData = PlaylistData.getInstance(context)
+        val offset = songIndexOffset
+        val dataIndex = at - offset
+        val realSongCount = songs.size - offset
 
-        if (songs.size == 1) {
+        // If deleting the only real song and no transient is active, tear down
+        // the player entirely. When transient is active, keep playing.
+        if (realSongCount == 1 && !hasTransientSong) {
             playlistData.removeSong(at = 0)
             playlistData.saveCurrentPlaylist()
             clearPlayerQueue()
@@ -1146,14 +1229,14 @@ class PlaybackEngine private constructor(private val context: Context) {
         if (at < currentSongIndex) {
             currentSongIndex--
         } else if (at == currentSongIndex && currentSongIndex >= songs.size - 1) {
-            currentSongIndex = songs.size - 2
+            currentSongIndex = (songs.size - 2).coerceAtLeast(offset)
         }
 
-        playlistData.removeSong(at = at)
+        playlistData.removeSong(at = dataIndex)
         playlistData.saveCurrentPlaylist()
         reloadFromPlaylistData()
 
-        if (deletingCurrentSong) {
+        if (deletingCurrentSong && !hasTransientSong) {
             loadPlayers()
             if (wasPlaying) startPlayback()
         }
@@ -1161,6 +1244,11 @@ class PlaybackEngine private constructor(private val context: Context) {
     }
 
     fun moveSong(from: Int, to: Int) {
+        val offset = songIndexOffset
+        // Transient slot (index 0) can't be moved, and nothing can be
+        // inserted above it.
+        if (hasTransientSong && (from == 0 || to == 0)) return
+
         val adjustedDest = if (to > from) to - 1 else to
         if (currentSongIndex == from) {
             currentSongIndex = adjustedDest
@@ -1171,27 +1259,36 @@ class PlaybackEngine private constructor(private val context: Context) {
         }
 
         val playlistData = PlaylistData.getInstance(context)
-        playlistData.moveSong(from, to)
+        playlistData.moveSong(from - offset, to - offset)
         playlistData.saveCurrentPlaylist()
         reloadFromPlaylistData()
         onStateChanged?.invoke()
     }
 
     fun updateSong(at: Int, title: String?, artist: String?, album: String?, notes: String?, artworkBitmap: android.graphics.Bitmap?) {
-        PlaylistData.getInstance(context).updateSong(at, title, artist, album, notes, artworkBitmap)
+        if (hasTransientSong && at == 0) return // transient is not editable
+        val dataIndex = at - songIndexOffset
+        PlaylistData.getInstance(context).updateSong(dataIndex, title, artist, album, notes, artworkBitmap)
         reloadFromPlaylistData()
         onStateChanged?.invoke()
     }
 
     fun addFilesFromDocumentPicker(uris: List<Uri>) {
-        val wasEmpty = songs.isEmpty()
+        val realWasEmpty = (songs.size - songIndexOffset) <= 0
         val playlistData = PlaylistData.getInstance(context)
         for (uri in uris) {
             playlistData.addFileFromUri(uri)
         }
         playlistData.saveCurrentPlaylist()
         reloadFromPlaylistData()
-        if (wasEmpty && songs.isNotEmpty()) {
+
+        if (hasTransientSong) {
+            // Keep transient playing; don't touch the player.
+            onStateChanged?.invoke()
+            return
+        }
+
+        if (realWasEmpty && songs.isNotEmpty()) {
             playListExists = true
             currentSongIndex = 0
             endOfPlaylist = false
@@ -1203,10 +1300,57 @@ class PlaybackEngine private constructor(private val context: Context) {
     // MARK: - Playlist switching
 
     fun switchToPlaylist(name: String) {
+        val playlistData = PlaylistData.getInstance(context)
+        if (playlistData.currentPlaylistName == name) return
+
+        val currentSnapshot = currentSong()
+        val canKeepPlaying = isPlaying && player != null && !endOfPlaylist &&
+                currentSnapshot != null && currentSnapshot.uri != null
+
+        if (canKeepPlaying) {
+            // Keep the current MediaPlayer running; prepend the playing song as
+            // a transient row at index 0 of the new playlist.
+            if (!hasTransientSong) {
+                transientArtworkFile = playlistData.artworkFile(forSongAt = currentSongIndex)
+            }
+            val baseId = currentSnapshot!!.id.removeSuffix("|transient")
+            val transient = currentSnapshot.copy(
+                id = "$baseId|transient",
+                isTransient = true
+            )
+
+            playlistData.switchToPlaylist(name)
+            val realSongs = playlistData.getSongs()
+            songs = listOf(transient) + realSongs
+            hasTransientSong = true
+            currentSongIndex = 0
+            endOfPlaylist = false
+            playListExists = true
+
+            // Shuffle array is for the underlying real playlist; build after
+            // the transient is removed.
+            if (stopAndGo == MODE_SHUFFLE) {
+                shuffleArray.clear()
+                shuffleHasStartedPlayback = false
+            }
+
+            // In crossfade/shuffle, schedule the boundary observer so the
+            // transient crossfades into the new playlist near its end.
+            if (stopAndGo == MODE_CROSSFADE || stopAndGo == MODE_SHUFFLE) {
+                configureBoundaryObserver()
+            }
+
+            onStateChanged?.invoke()
+            updateMediaSessionState()
+            return
+        }
+
+        // Not playing — original behavior.
         detachCurrentPlayer()
         isPlaying = false
+        hasTransientSong = false
+        transientArtworkFile = null
 
-        val playlistData = PlaylistData.getInstance(context)
         playlistData.switchToPlaylist(name)
         reloadFromPlaylistData()
 
@@ -1226,6 +1370,123 @@ class PlaybackEngine private constructor(private val context: Context) {
             playListExists = false
         }
 
+        onStateChanged?.invoke()
+        updateMediaSessionState()
+    }
+
+    /**
+     * Releases the transient player and repopulates `songs` with the new
+     * playlist's real songs. Leaves currentSongIndex/playback state to the caller.
+     */
+    private fun clearTransientSong() {
+        safeRelease(player)
+        player = null
+        safeRelease(fadingOutPlayer)
+        fadingOutPlayer = null
+        hasTransientSong = false
+        transientArtworkFile = null
+        reloadFromPlaylistData()
+        removeCrossfadeBoundary()
+    }
+
+    private fun leaveTransientAndStart(wasPlaying: Boolean) {
+        clearTransientSong()
+        currentSongIndex = 0
+        endOfPlaylist = false
+        if (songs.isEmpty()) {
+            playListExists = false
+            isPlaying = false
+            onStateChanged?.invoke()
+            updateMediaSessionState()
+            return
+        }
+        playListExists = true
+        if (stopAndGo == MODE_SHUFFLE) {
+            shuffleArray.clear()
+            generateShuffleArray()
+            shuffleHasStartedPlayback = false
+            currentSongIndex = shuffleArray.firstOrNull() ?: 0
+        }
+        loadPlayers()
+        if (wasPlaying) startPlayback() else isPlaying = false
+        onStateChanged?.invoke()
+        updateMediaSessionState()
+    }
+
+    /**
+     * Transient's MediaPlayer completed naturally (non-crossfade modes).
+     * In STOP_AND_GO we pause at the new playlist's first song; in other
+     * non-crossfade modes we keep playing.
+     */
+    private fun handleTransientEnded() {
+        clearTransientSong()
+        currentSongIndex = 0
+        endOfPlaylist = false
+        if (songs.isEmpty()) {
+            playListExists = false
+            isPlaying = false
+            onStateChanged?.invoke()
+            updateMediaSessionState()
+            return
+        }
+        playListExists = true
+        if (stopAndGo == MODE_SHUFFLE) {
+            // Shuffle uses boundary observer, not this path — defensive only.
+            shuffleArray.clear()
+            generateShuffleArray()
+            shuffleHasStartedPlayback = false
+            currentSongIndex = shuffleArray.firstOrNull() ?: 0
+        }
+        loadPlayers()
+        if (stopAndGo == MODE_STOP_AND_GO) {
+            isPlaying = false
+        } else {
+            startPlayback()
+        }
+        onStateChanged?.invoke()
+        updateMediaSessionState()
+    }
+
+    /**
+     * Transient crosses the crossfade boundary — fade it out while the new
+     * playlist's first (or shuffle-start) song fades in.
+     */
+    private fun crossfadeFromTransient() {
+        // Detach transient player so its completion doesn't fire.
+        val transientPlayer = player
+        try { transientPlayer?.setOnCompletionListener(null) } catch (_: Exception) {}
+
+        hasTransientSong = false
+        transientArtworkFile = null
+        reloadFromPlaylistData()
+        currentSongIndex = 0
+        endOfPlaylist = false
+
+        if (songs.isEmpty()) {
+            // No real songs — fade the transient out into silence.
+            safeRelease(fadingOutPlayer)
+            fadingOutPlayer = transientPlayer
+            player = null
+            fadeOutFadingPlayer()
+            playListExists = false
+            isPlaying = false
+            onStateChanged?.invoke()
+            updateMediaSessionState()
+            return
+        }
+
+        playListExists = true
+        if (stopAndGo == MODE_SHUFFLE) {
+            shuffleArray.clear()
+            generateShuffleArray()
+            shuffleHasStartedPlayback = false
+            currentSongIndex = shuffleArray.firstOrNull() ?: 0
+        }
+        // loadPlayers() will shift the current player (the transient) into
+        // fadingOutPlayer and create a new player for the real song.
+        loadPlayers()
+        fadeOutFadingPlayer()
+        startPlayback()
         onStateChanged?.invoke()
         updateMediaSessionState()
     }

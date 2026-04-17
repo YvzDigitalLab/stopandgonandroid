@@ -32,5 +32,6 @@ data class Song(
     val album: String? = null,
     val artworkFileName: String? = null,
     val notes: String? = null,
-    val isImportedFile: Boolean = true
+    val isImportedFile: Boolean = true,
+    val isTransient: Boolean = false
 )

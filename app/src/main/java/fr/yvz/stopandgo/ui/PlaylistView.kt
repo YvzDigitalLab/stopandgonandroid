@@ -101,6 +101,10 @@ fun PlaylistView(
         // where 'to' is the insertion index BEFORE removal — convert.
         val fromIdx = from.index
         val toIdx = to.index
+        // Transient row (if any) lives at index 0 and must not be moved or
+        // displaced.
+        val hasTransient = viewModel.playlistSongs.firstOrNull()?.isTransient == true
+        if (hasTransient && (fromIdx == 0 || toIdx == 0)) return@rememberReorderableLazyListState
         val insertionIdx = if (toIdx > fromIdx) toIdx + 1 else toIdx
         viewModel.moveSong(from = fromIdx, to = insertionIdx)
     }
@@ -335,6 +339,8 @@ fun SongRow(
     onDelete: () -> Unit,
     dragHandleModifier: Modifier = Modifier
 ) {
+    val transient = song.isTransient
+    val contentAlpha = if (transient) 0.4f else 1f
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -342,11 +348,14 @@ fun SongRow(
                 if (isDragging) MaterialTheme.colorScheme.surfaceVariant
                 else MaterialTheme.colorScheme.surface
             )
-            .clickable(enabled = !isDragging) { onTap() }
+            .then(
+                if (transient) Modifier
+                else Modifier.clickable(enabled = !isDragging) { onTap() }
+            )
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (isEditing) {
+        if (isEditing && !transient) {
             IconButton(onClick = onDelete) {
                 Icon(
                     imageVector = Icons.Default.Delete,
@@ -362,30 +371,34 @@ fun SongRow(
                     text = song.title ?: "",
                     fontSize = 14.sp,
                     fontStyle = FontStyle.Italic,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f * contentAlpha)
                 )
                 Text(
                     text = if (song.isImportedFile) "File missing — delete and import again"
                     else "Not available — download or check DRM",
                     fontSize = 12.sp,
                     fontStyle = FontStyle.Italic,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f * contentAlpha)
                 )
             } else {
                 Text(
                     text = song.title ?: "Song not on device!",
                     fontSize = 14.sp,
-                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal
+                    fontStyle = if (transient) FontStyle.Italic else FontStyle.Normal,
+                    fontWeight = if (isCurrent && !transient) FontWeight.Bold else FontWeight.Normal,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = contentAlpha)
                 )
                 Text(
                     text = "${song.artist ?: ""} - ${song.album ?: ""}",
                     fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f * contentAlpha)
                 )
             }
         }
 
-        if (isEditing) {
+        if (transient) {
+            // No affordances for the transient row.
+        } else if (isEditing) {
             // Drag handle (long-press to grab, drag to reorder)
             Box(
                 modifier = dragHandleModifier
